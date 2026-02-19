@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Check Claude.ai live usage limits (Max/Pro plan)."""
+
+import json, subprocess, sys, urllib.request, urllib.error
+from datetime import datetime, timezone
+
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+KEYCHAIN_ACCOUNT = "wgj-ai"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+def _read_keychain():
+    raw = subprocess.check_output([
+        "security", "find-generic-password",
+        "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"
+    ], text=True).strip()
+    return json.loads(raw)
+
+def _write_keychain(data):
+    payload = json.dumps(data)
+    hex_payload = payload.encode("utf-8").hex()
+    # Delete then add (security doesn't have a reliable update)
+    subprocess.run([
+        "security", "delete-generic-password",
+        "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT
+    ], capture_output=True)
+    subprocess.check_call([
+        "security", "add-generic-password",
+        "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT,
+        "-X", hex_payload
+    ])
+
+def _refresh_token(data):
+    """Refresh the OAuth token using the refresh_token grant."""
+    oauth = data["claudeAiOauth"]
+    refresh_token = oauth.get("refreshToken")
+    if not refresh_token:
+        raise RuntimeError("No refresh token available")
+
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+    }).encode()
+
+    req = urllib.request.Request(TOKEN_URL, data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "Claude-Code/1.0"},
+        method="POST")
+    resp = json.loads(urllib.request.urlopen(req).read().decode())
+
+    # Update the stored credentials
+    oauth["accessToken"] = resp["access_token"]
+    if "refresh_token" in resp:
+        oauth["refreshToken"] = resp["refresh_token"]
+    # expires_in is seconds; store as ms timestamp
+    expires_in = resp.get("expires_in", 3600)
+    oauth["expiresAt"] = int(datetime.now(timezone.utc).timestamp() * 1000) + (expires_in * 1000)
+
+    _write_keychain(data)
+    return oauth["accessToken"]
+
+def get_token():
+    data = _read_keychain()
+    oauth = data["claudeAiOauth"]
+    tier = oauth.get("rateLimitTier", "unknown")
+
+    # Check if token is expired or about to expire (within 5 min)
+    expires_at = oauth.get("expiresAt", 0)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if now_ms >= (expires_at - 300000):  # 5 min buffer
+        try:
+            new_token = _refresh_token(data)
+            return new_token, tier
+        except Exception as e:
+            if now_ms >= expires_at:
+                raise RuntimeError(
+                    f"OAuth token expired and refresh failed: {e}. "
+                    "Run any `claude` command to re-authenticate."
+                )
+            # Token not yet expired, just close to it — use existing
+            pass
+
+    return oauth["accessToken"], tier
+
+def fetch_usage(token):
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage",
+        headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"})
+    return json.loads(urllib.request.urlopen(req).read().decode())
+
+def fmt_reset(iso_str):
+    if not iso_str: return ""
+    dt = datetime.fromisoformat(iso_str)
+    now = datetime.now(timezone.utc)
+    delta = dt - now
+    h, m = divmod(int(delta.total_seconds()) // 60, 60)
+    local = dt.astimezone().strftime("%I:%M %p %b %d")
+    return f"{local} ({h}h{m:02d}m)"
+
+def bar(pct, width=20):
+    used = pct / 100
+    filled = int(used * width)
+    remaining = 100 - pct
+    if remaining > 60: color = "\033[32m"      # green
+    elif remaining > 30: color = "\033[33m"     # yellow
+    elif remaining > 10: color = "\033[38;5;208m"  # orange
+    else: color = "\033[31m"                    # red
+    reset = "\033[0m"
+    return f"{color}{'█' * filled}{'░' * (width - filled)}{reset} {remaining:.0f}% left"
+
+def main():
+    if "--refresh" in sys.argv:
+        try:
+            data = _read_keychain()
+            new_token = _refresh_token(data)
+            print(f"Token refreshed successfully. New token prefix: {new_token[:15]}...")
+        except Exception as e:
+            print(f"Refresh failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    json_mode = "--json" in sys.argv
+    try:
+        token, tier = get_token()
+        data = fetch_usage(token)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if json_mode:
+        print(json.dumps(data, indent=2))
+        return
+
+    print(f"\n  Claude Usage ({tier})")
+    print(f"  {'─' * 40}")
+
+    for key, label in [("five_hour", "5-Hour"), ("seven_day", "Weekly")]:
+        bucket = data.get(key)
+        if not bucket: continue
+        pct = bucket["utilization"]
+        reset = fmt_reset(bucket.get("resets_at"))
+        print(f"  {label:>8}  {bar(pct)}  resets {reset}")
+
+    for key, label in [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")]:
+        bucket = data.get(key)
+        if not bucket: continue
+        pct = bucket["utilization"]
+        if pct > 0:
+            reset = fmt_reset(bucket.get("resets_at"))
+            print(f"  {label:>8}  {bar(pct)}  resets {reset}")
+
+    extra = data.get("extra_usage")
+    if extra and extra.get("is_enabled"):
+        used = extra.get("used_credits", 0)
+        limit = extra.get("monthly_limit", 0)
+        pct = extra.get("utilization", 0)
+        print(f"  {'Credits':>8}  {bar(pct)}  ${used:.0f}/${limit} used")
+
+    print()
+
+if __name__ == "__main__":
+    main()
